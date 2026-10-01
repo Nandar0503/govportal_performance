@@ -899,7 +899,8 @@ window.SEED={"generatedAt":"2026-10-01T10:35:45","sources":["dashboard_performan
     if (!snap.exists()) return null;
     return Object.assign({ id: user.uid }, snap.data());
   }
-  function emit(p, err) { profile = p; listeners.forEach(f => f(p, err)); }
+  let authKnown = false, lastErr = null;
+  function emit(p, err) { profile = p; authKnown = true; lastErr = err || null; listeners.forEach(f => f(p, err)); }
 
   async function queryScoped(colName, ids) {
     const col = F.collection(db, colName);
@@ -909,13 +910,69 @@ window.SEED={"generatedAt":"2026-10-01T10:35:45","sources":["dashboard_performan
     return out;
   }
 
+
+  /* ---------- Loader SDK Firebase (build "compat" UMD, mandiri) ----------
+   * Dicoba dari beberapa CDN berurutan: jsDelivr dulu, lalu gstatic.
+   * Jaringan kantor / ad-blocker sering memblokir www.gstatic.com. */
+  function loadScriptOnce(src) {
+    return new Promise((res, rej) => { const s = document.createElement('script'); s.src = src; s.async = false; s.onload = res; s.onerror = () => { s.remove(); rej(new Error('Gagal memuat ' + src)); }; document.head.appendChild(s); });
+  }
+  async function loadFirebaseCompat() {
+    const v = window.APP_CONFIG.firebaseSdkVersion;
+    const bases = [`https://cdn.jsdelivr.net/npm/firebase@${v}/`, `https://www.gstatic.com/firebasejs/${v}/`, `https://unpkg.com/firebase@${v}/`];
+    let lastErr = null;
+    for (const base of bases) {
+      try {
+        if (!window.firebase || !window.firebase.initializeApp) { try { delete window.firebase; } catch (e) { window.firebase = undefined; } await loadScriptOnce(base + 'firebase-app-compat.js'); }
+        if (!window.firebase.auth) await loadScriptOnce(base + 'firebase-auth-compat.js');
+        if (!window.firebase.firestore) await loadScriptOnce(base + 'firebase-firestore-compat.js');
+        if (!window.firebase.storage) { try { await loadScriptOnce(base + 'firebase-storage-compat.js'); } catch (e) { } }
+        return compatAdapter(window.firebase);
+      } catch (e) { lastErr = e; console.warn(e.message); }
+    }
+    throw new Error((lastErr ? lastErr.message : 'SDK Firebase tidak dapat dimuat') + '. Periksa koneksi internet / firewall kantor.');
+  }
+  // Adapter: menyediakan API bergaya modular di atas SDK compat
+  function compatAdapter(fb) {
+    const snapDoc = s => ({ id: s.id, exists: () => s.exists, data: () => s.data() });
+    return {
+      initializeApp: (cfg, name) => name ? fb.initializeApp(cfg, name) : (fb.apps.length ? fb.app() : fb.initializeApp(cfg)),
+      deleteApp: a => a.delete(),
+      getAuth: a => a.auth(),
+      onAuthStateChanged: (au, cb) => au.onAuthStateChanged(cb),
+      signInWithEmailAndPassword: (au, e, p) => au.signInWithEmailAndPassword(e, p),
+      createUserWithEmailAndPassword: (au, e, p) => au.createUserWithEmailAndPassword(e, p),
+      signOut: au => au.signOut(),
+      sendPasswordResetEmail: (au, e) => au.sendPasswordResetEmail(e),
+      setPersistence: (au, p) => au.setPersistence(p),
+      browserLocalPersistence: fb.auth.Auth.Persistence.LOCAL,
+      browserSessionPersistence: fb.auth.Auth.Persistence.SESSION,
+      getFirestore: a => a.firestore(),
+      doc: (d, ...path) => d.doc(path.join('/')),
+      collection: (d, ...path) => d.collection(path.join('/')),
+      getDoc: async ref => snapDoc(await ref.get()),
+      getDocs: async q => { const s = await q.get(); return { docs: s.docs.map(snapDoc), size: s.size, empty: s.empty }; },
+      setDoc: (ref, data) => ref.set(data),
+      updateDoc: (ref, data) => ref.update(data),
+      deleteDoc: ref => ref.delete(),
+      addDoc: (col, data) => col.add(data),
+      query: (col, ...cons) => cons.reduce((q, c) => c(q), col),
+      where: (f, op, v) => q => q.where(f, op, v),
+      orderBy: (f, dir) => q => q.orderBy(f, dir),
+      limit: n => q => q.limit(n),
+      writeBatch: d => { const b = d.batch(); return { set: (r, x) => b.set(r, x), update: (r, x) => b.update(r, x), delete: r => b.delete(r), commit: () => b.commit() }; },
+      serverTimestamp: () => fb.firestore.FieldValue.serverTimestamp(),
+      getStorage: fb.storage ? (a => a.storage()) : null,
+      ref: (st, path) => st.ref(path),
+      uploadBytes: (r, f) => r.put(f),
+      getDownloadURL: r => r.getDownloadURL()
+    };
+  }
+
   const DS = {
     mode: 'firebase',
     async init() {
-      const v = window.APP_CONFIG.firebaseSdkVersion; const base = `https://www.gstatic.com/firebasejs/${v}/`;
-      const [A, AU, FS] = await Promise.all([import(base + 'firebase-app.js'), import(base + 'firebase-auth.js'), import(base + 'firebase-firestore.js')]);
-      let ST = null; try { ST = await import(base + 'firebase-storage.js'); } catch (e) { ST = null; }
-      F = Object.assign({}, A, AU, FS, ST ? { ref: ST.ref, uploadBytes: ST.uploadBytes, getDownloadURL: ST.getDownloadURL, getStorage: ST.getStorage } : {});
+      F = await loadFirebaseCompat();
       app = F.initializeApp(window.APP_CONFIG.firebase);
       auth = F.getAuth(app); db = F.getFirestore(app);
       try { storage = F.getStorage ? F.getStorage(app) : null; } catch (e) { storage = null; }
@@ -932,7 +989,8 @@ window.SEED={"generatedAt":"2026-10-01T10:35:45","sources":["dashboard_performan
       });
       return 'firebase';
     },
-    onAuthChange(cb) { listeners.push(cb); },
+    // status auth bisa sudah diketahui sebelum listener didaftarkan: kirim ulang status terakhir
+    onAuthChange(cb) { listeners.push(cb); if (authKnown) setTimeout(() => cb(profile, lastErr), 0); },
     sessionId() { return sid; },
     async bootstrapStatus() { const s = await F.getDoc(F.doc(db, 'system_settings', 'bootstrap')); return { needsSetup: !s.exists() }; },
     async createFirstAdmin({ name, email, password, username }) {
@@ -2555,8 +2613,11 @@ window.SEED={"generatedAt":"2026-10-01T10:35:45","sources":["dashboard_performan
     if (!ds) { ds = window.DemoDataService; await ds.init(); }
     App.ds = ds;
     try { const t = localStorage.getItem('ccpm-theme'); if (t) document.documentElement.setAttribute('data-theme', t); } catch (e) { }
-    let first = true;
+    let first = true, authSeen = false;
+    // pengaman: bila status auth tidak kunjung datang, tampilkan halaman login
+    setTimeout(() => { if (!authSeen && !App.profile) renderLogin(); }, 8000);
     ds.onAuthChange(async (profile, err) => {
+      authSeen = true;
       if (!profile) { App.profile = null; stopIdle(); renderLogin(err); return; }
       if (App.profile && App.profile.id === profile.id && !first) { App.profile = profile; App.computeScope(); renderShell(); return; }
       first = false; App.profile = profile;
